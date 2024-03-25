@@ -1,0 +1,107 @@
+#!/usr/bin/env zsh
+
+project_name=$(basename $(pwd))
+workdir="/tmp/${project_name}"
+
+if [ ! -d $workdir ]; 
+then
+    mkdir -p $workdir
+fi
+
+# Cleanup workdir
+find $workdir -type f -delete
+
+function run_app() {
+    cmd=$@
+    if [ -f "${workdir}/pid" ]; then
+        current_pid=$(cat ${workdir}/pid)
+        if [ ! $(ps -o pid= $current_pid) ]; then
+            echo >&2 'Current app is not found'
+            echo '' >| "${workdir}/pid"
+            exit 1
+        fi
+        kill $(ps $current_pid -o pid=)
+        # Wait until the application process totally disapear
+        while ; do
+            if [ ! $(ps -o pid= $current_pid) ]; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+    # Run the application background
+    eval "${cmd} &"
+    echo $!  >| "${workdir}/pid"
+}
+
+function main() {
+    # Capture SIGTERM signal and perform cleanup
+    interrupted=false
+    trap 'tput cnorm; interrupted=true' INT TERM
+
+    local app_cmd=""
+    local positional=()
+
+    local usage=(
+        "watch [-c|--command=<command>]"
+        ""
+        "Example: watch 'python worker.py'"
+    )
+    opterr() { echo >&2 "watcher: Unknown option '$1'" }
+
+    while (( $# )); do
+        case $1 in
+        --)                 shift; positional+=("${@[@]}"); break  ;;
+        -h|--help)          printf "%s\n" $usage && return         ;;
+        -c|--command)       shift; app_cmd=$1                      ;;
+        -*)                 opterr $1 && return 2                  ;;
+        *)                  positional+=("${@[@]}"); break         ;;
+        esac
+        shift
+    done
+
+    if [ -z $app_cmd ];
+    then
+        app_cmd="${positional[@]}"
+    fi
+
+    run_app $app_cmd
+    while :
+    do
+        reload_app=0
+        # Watch file changes
+        for wf in $(git ls-files -m) $(git ls-files -o --exclude-standard)
+        do
+            wf_id=$(sed 's#[\/\.]#_#g' <<< $wf)
+            wf_path="${workdir}/${wf_id}"
+
+            content_hash=$(git hash-object $wf)
+
+            # Handle new file added
+            if [ ! -f "${wf_path}" ]
+            then
+                echo $content_hash >| $wf_path
+                reload_app=1
+            fi
+
+            prevhash=$(cat $wf_path)
+            if [ ! "${prevhash}" = "${content_hash}" ];
+            then
+                echo $wf changed
+                echo $content_hash >| $wf_path
+                reload_app=1
+            fi
+        done
+        # Reload app when there exist file change
+        [[ $reload_app -eq 1 ]] && run_app $app_cmd
+        sleep 1
+
+        if [[ "${interrupted}" = "true" ]]; then
+            current_pid=$(cat ${workdir}/pid)
+            kill $(ps $current_pid -o pid=)
+            break
+        fi
+    done
+}
+
+main $@
